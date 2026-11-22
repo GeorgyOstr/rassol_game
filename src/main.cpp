@@ -1393,7 +1393,9 @@ int main(int argc, char** argv) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
     SDL_Window* win = SDL_CreateWindow("RASSOL: Cyber Brine Runner", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, SW, SH,
                                        SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    R = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
+    const char* vs = getenv("RASSOL_VSYNC");
+    bool useVsync = vs && vs[0] == '1';
+    R = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | (useVsync ? SDL_RENDERER_PRESENTVSYNC : 0) | SDL_RENDERER_TARGETTEXTURE);
     if (!R) R = SDL_CreateRenderer(win, -1, SDL_RENDERER_TARGETTEXTURE);
     if (!R) { fprintf(stderr, "renderer: %s\n", SDL_GetError()); return 1; }
     bool perf = getenv("RASSOL_PERF") != nullptr;
@@ -1598,15 +1600,28 @@ int main(int argc, char** argv) {
         if (perf) {
             Uint64 tP = SDL_GetPerformanceCounter();
             auto ms = [&](Uint64 a, Uint64 b) { return (double)(b - a) * 1000.0 / freq; };
-            static double sDt = 0, mDt = 0, sUp = 0, sRe = 0, mRe = 0, sPr = 0, mPr = 0; static int cnt = 0;
+            static int slow = 0; static double sDt = 0, mDt = 0, sUp = 0, sRe = 0, mRe = 0, sPr = 0, mPr = 0; static int cnt = 0;
             double up = ms(now, tR0), re = ms(tR0, tR1), pr = ms(tR1, tP);
-            sDt += dt * 1000; mDt = std::max(mDt, (double)rawDt * 1000); sUp += up; sRe += re; mRe = std::max(mRe, re); sPr += pr; mPr = std::max(mPr, pr);
+            slow += rawDt > 1.f / 60.f; sDt += dt * 1000; mDt = std::max(mDt, (double)rawDt * 1000); sUp += up; sRe += re; mRe = std::max(mRe, re); sPr += pr; mPr = std::max(mPr, pr);
             if (++cnt == 120) {
-                fprintf(stderr, "dt %.2f rawmax %.2f  upd %.2f  rend %.2f/%.2f  present %.2f/%.2f  parts %zu\n", sDt / cnt, mDt, sUp / cnt, sRe / cnt, mRe, sPr / cnt, mPr, parts.size());
-                sDt = mDt = sUp = sRe = mRe = sPr = mPr = 0; cnt = 0;
+                fprintf(stderr, "<60fps %d  dt %.2f rawmax %.2f  upd %.2f  rend %.2f/%.2f  present %.2f/%.2f  parts %zu\n", slow, sDt / cnt, mDt, sUp / cnt, sRe / cnt, mRe, sPr / cnt, mPr, parts.size());
+                slow = 0; sDt = mDt = sUp = sRe = mRe = sPr = mPr = 0; cnt = 0;
             }
         }
         if (smokeFrames && frame >= smokeFrames) running = false;
+        if (!useVsync) {
+            // Own frame pacing: sleep most of the way, spin the last ~3ms (SDL_Delay oversleeps).
+            static Uint64 next = 0;
+            Uint64 period = (Uint64)(vsyncDt * freq), t = SDL_GetPerformanceCounter();
+            if (next == 0 || t > next + period) next = t;
+            next += period;
+            for (;;) {
+                t = SDL_GetPerformanceCounter();
+                if (t >= next) break;
+                double left = (double)(next - t) / freq;
+                if (left > 0.004) SDL_Delay((Uint32)((left - 0.003) * 1000));
+            }
+        }
     }
     if (snd::dev) SDL_CloseAudioDevice(snd::dev);
     SDL_DestroyRenderer(R);
