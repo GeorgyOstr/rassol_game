@@ -36,8 +36,13 @@ std::atomic<float> intensity{0.3f};
 std::atomic<bool> musicOn{true};
 SDL_AudioDeviceID dev = 0;
 
-struct Voice { bool on = false; float t = 0, dur = 0, delay = 0, f0 = 0, f1 = 0, noise = 0, vol = 0, ph = 0; int wave = 0; };
+struct Voice { bool on = false; float t = 0, dur = 0, delay = 0, f = 0, fmul = 1, noise = 0, vol = 0, ph = 0; int wave = 0; };
 Voice voices[48];
+// SFX requests go through a lock-free single-producer/single-consumer ring,
+// so the game thread never blocks on SDL_LockAudioDevice while the callback runs.
+constexpr unsigned QN = 64;
+Voice queue[QN];
+std::atomic<unsigned> qHead{0}, qTail{0};
 
 static uint32_t rs = 0x9E3779B9u;
 inline float nrand() { rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; return (float)(rs & 0xFFFFFF) / 8388608.f - 1.f; }
@@ -174,6 +179,11 @@ void callback(void*, Uint8* stream, int len) {
     float I = intensity.load();
     bool mOn = musicOn.load();
     const float dt = 1.f / SR;
+    unsigned qt = qTail.load(std::memory_order_relaxed), qh = qHead.load(std::memory_order_acquire);
+    for (; qt != qh; qt++) {
+        for (auto& v : voices) if (!v.on) { v = queue[qt % QN]; break; }
+    }
+    qTail.store(qt, std::memory_order_release);
     for (int i = 0; i < n; i++) {
         float L = 0, R = 0;
         M->render(I, L, R);
@@ -184,8 +194,9 @@ void callback(void*, Uint8* stream, int len) {
             if (v.delay > 0) { v.delay -= dt; continue; }
             float p = v.t / v.dur;
             if (p >= 1.f) { v.on = false; continue; }
-            float f = v.f0 * powf(v.f1 / v.f0, p);
-            v.ph += f * dt;
+            v.ph += v.f * dt;
+            v.f *= v.fmul;
+            v.ph -= floorf(v.ph);
             float o;
             if (v.wave == 0) o = sinf(2 * PI * v.ph);
             else if (v.wave == 1) o = frac(v.ph) < 0.5f ? 1.f : -1.f;
@@ -203,11 +214,10 @@ void callback(void*, Uint8* stream, int len) {
 
 void play(float f0, float f1, float dur, int wave, float noise, float vol, float delay = 0) {
     if (!dev) return;
-    SDL_LockAudioDevice(dev);
-    for (auto& v : voices) {
-        if (!v.on) { v = Voice{true, 0, dur, delay, f0, f1, noise, vol, 0, wave}; break; }
-    }
-    SDL_UnlockAudioDevice(dev);
+    unsigned h = qHead.load(std::memory_order_relaxed);
+    if (h - qTail.load(std::memory_order_acquire) >= QN) return;  // queue full: drop
+    queue[h % QN] = Voice{true, 0, dur, delay, f0, powf(f1 / f0, 1.f / (dur * SR)), noise, vol, 0, wave};
+    qHead.store(h + 1, std::memory_order_release);
 }
 
 void init() {
@@ -240,7 +250,9 @@ static void sfxWin() {
 static SDL_Renderer* R = nullptr;
 static SDL_Texture *texGlow = nullptr, *texBar = nullptr, *texOverlay = nullptr;
 static SDL_Texture* texLayer[3] = {};
-static float camX = 0, camY = 0, shakeX = 0, shakeY = 0;
+static SDL_Texture *texSky = nullptr, *texTile = nullptr, *texScreen = nullptr;
+static int layerH[3] = {SH, SH, SH};
+static float camX = 0, camY = 0, shakeX = 0, shakeY = 0, camLook = 0;
 
 static void blend(SDL_BlendMode m) { SDL_SetRenderDrawBlendMode(R, m); }
 static void fillPoly(const std::vector<SDL_FPoint>& p, SDL_Color c) {
@@ -372,17 +384,31 @@ static SDL_Texture* makeTex(int w, int h, F fn, SDL_BlendMode bm) {
     return t;
 }
 
+// Parallax building layer. Texture is cropped to the building band (no wasted
+// transparent fill) and the atmospheric haze is baked into the colors, which is
+// mathematically the same as the fullscreen haze rects we used to draw per frame.
+static SDL_Color hazeCol(SDL_Color c, int passes) {
+    const float a = 28.f / 255.f;
+    for (int i = 0; i < passes; i++) {
+        c.r = (Uint8)(c.r + (60 - c.r) * a); c.g = (Uint8)(c.g + (10 - c.g) * a); c.b = (Uint8)(c.b + (80 - c.b) * a);
+    }
+    return c;
+}
 static SDL_Texture* makeLayer(int idx) {
     const int LWpx = 1600;
-    SDL_Texture* t = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, LWpx, SH);
+    float minH = idx == 0 ? 260.f : idx == 1 ? 190.f : 130.f, maxH = idx == 0 ? 540.f : idx == 1 ? 430.f : 330.f;
+    const int Ht = (int)maxH + 50;
+    layerH[idx] = Ht;
+    const int hz = 2 - idx;
+    SDL_Texture* t = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, LWpx, Ht);
     SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
     SDL_SetRenderTarget(R, t);
     SDL_SetRenderDrawColor(R, 0, 0, 0, 0);
     SDL_RenderClear(R);
     std::mt19937 g(100 + idx);
     auto fr = [&](float a, float b) { return std::uniform_real_distribution<float>(a, b)(g); };
+    auto hrect = [&](float x, float y, float w, float h, SDL_Color c) { rect(x, y, w, h, hazeCol(c, hz)); };
     SDL_Color base = idx == 0 ? C(30, 14, 60) : idx == 1 ? C(17, 9, 40) : C(9, 5, 22);
-    float minH = idx == 0 ? 260.f : idx == 1 ? 190.f : 130.f, maxH = idx == 0 ? 540.f : idx == 1 ? 430.f : 330.f;
     SDL_Color pal[4] = {C(0, 240, 255), C(255, 40, 200), C(255, 220, 60), C(140, 80, 255)};
     float lit = idx == 0 ? 0.12f : idx == 1 ? 0.2f : 0.28f;
     float x = 0;
@@ -390,29 +416,29 @@ static SDL_Texture* makeLayer(int idx) {
     while (x < LWpx) {
         float bw = fr(60, 170) * (idx == 2 ? 1.3f : 1.f);
         if (x + bw > LWpx) bw = LWpx - x;
-        float bh = fr(minH, maxH), top = SH - bh;
-        rect(x, top, bw, bh, base);
-        rect(x, top, bw, 2, C(pal[idx].r, pal[idx].g, pal[idx].b, 70));
+        float bh = fr(minH, maxH), top = Ht - bh;
+        hrect(x, top, bw, bh, base);
+        hrect(x, top, bw, 2, C(pal[idx].r, pal[idx].g, pal[idx].b, 70));
         float ws = idx == 0 ? 0.7f : idx == 1 ? 0.85f : 1.f;
-        for (float wy = top + 12; wy < SH - 10; wy += 14 * ws)
+        for (float wy = top + 12; wy < Ht - 10; wy += 14 * ws)
             for (float wx = x + 6; wx < x + bw - 8; wx += 10 * ws)
                 if (fr(0, 1) < lit) {
                     SDL_Color c = pal[(int)fr(0, 3.99f)];
                     c.a = (Uint8)fr(60, 200);
-                    rect(wx, wy, 4 * ws, 6 * ws, c);
+                    hrect(wx, wy, 4 * ws, 6 * ws, c);
                 }
         if (fr(0, 1) < 0.35f && bw > 50) {
             SDL_Color c = pal[(int)fr(0, 3.99f)];
             float sx = x + fr(10, bw - 30), sy = top + fr(20, 120), sh2 = fr(40, 110);
-            rect(sx - 6, sy - 6, 22, sh2 + 12, C(c.r, c.g, c.b, 40));
-            rect(sx - 3, sy - 3, 16, sh2 + 6, C(c.r, c.g, c.b, 70));
-            rect(sx, sy, 10, sh2, C(c.r, c.g, c.b, 230));
-            rect(sx + 3, sy + 3, 4, sh2 - 6, C(255, 255, 255, 180));
+            hrect(sx - 6, sy - 6, 22, sh2 + 12, C(c.r, c.g, c.b, 40));
+            hrect(sx - 3, sy - 3, 16, sh2 + 6, C(c.r, c.g, c.b, 70));
+            hrect(sx, sy, 10, sh2, C(c.r, c.g, c.b, 230));
+            hrect(sx + 3, sy + 3, 4, sh2 - 6, C(255, 255, 255, 180));
         }
         if (fr(0, 1) < 0.4f) {
             float ax = x + bw * fr(0.2f, 0.8f);
-            rect(ax, top - 40, 2, 40, base);
-            rect(ax - 2, top - 44, 6, 4, C(255, 30, 60, 220));
+            hrect(ax, top - 40, 2, 40, base);
+            hrect(ax - 2, top - 44, 6, 4, C(255, 30, 60, 220));
         }
         x += bw + fr(0, 25);
     }
@@ -612,7 +638,7 @@ static void hurtPlayer(float fromX) {
     float dir = (P.x + P.w / 2 < fromX) ? -1.f : 1.f;
     P.vx = dir * 380; P.vy = -480;
     addTrauma(0.55f);
-    hitstop = 0.08f;
+    hitstop = 0.05f;
     sfxHurt();
     float cx = P.x + P.w / 2, cy = P.y + P.h / 2;
     burst(cx, cy, 14, C(200, 250, 255), 420, 2, 0.6f, 4, 900);
@@ -638,7 +664,6 @@ static void killEnemy(Enemy& e) {
     burst(cx, cy, 26, c, 520, 0, 0.5f, 3, 300);
     burst(cx, cy, 14, c, 260, 1, 0.8f, 4, 800);
     popup(cx, e.y - 10, "+" + std::to_string(pts) + (combo > 1 ? " X" + std::to_string(std::min(combo, 8)) : ""), c);
-    hitstop = std::max(hitstop, 0.045f);
     addTrauma(0.22f);
     sfxKill();
 }
@@ -885,7 +910,7 @@ static void drawSky() {
     blend(SDL_BLENDMODE_BLEND);
 
     // synthwave sun
-    float sx = 880 - fmodf(camX * 0.02f, 400.f), sy = 300, sr = 150;
+    float sx = 880, sy = 300, sr = 150;
     blend(SDL_BLENDMODE_ADD);
     glow(sx, sy, sr * 2.6f, C(255, 40, 160), 0.35f);
     blend(SDL_BLENDMODE_BLEND);
@@ -907,16 +932,28 @@ static void drawSky() {
     }
 }
 
+static SDL_Texture* makeSky() {
+    SDL_Texture* t = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, SW, SH);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_NONE);
+    SDL_SetRenderTarget(R, t);
+    drawSky();
+    rect(0, 0, SW, SH, C(60, 10, 80, 28));
+    rect(0, 0, SW, SH, C(60, 10, 80, 28));
+    SDL_SetRenderTarget(R, nullptr);
+    return t;
+}
+
 static void drawLayers() {
     const float fac[3] = {0.08f, 0.22f, 0.42f};
     const float yoff[3] = {-10, 60, 150};
     for (int i = 0; i < 3; i++) {
         float off = -fmodf(camX * fac[i] + shakeX * 0.2f, 1600.f);
+        if (off > 0) off -= 1600.f;
+        float y = yoff[i] + SH - layerH[i];
         for (int k = 0; k < 2; k++) {
-            SDL_FRect d{off + k * 1600.f, yoff[i], 1600.f, (float)SH};
+            SDL_FRect d{off + k * 1600.f, y, 1600.f, (float)layerH[i]};
             SDL_RenderCopyF(R, texLayer[i], nullptr, &d);
         }
-        if (i < 2) rect(0, 0, SW, SH, C(60, 10, 80, 28));
     }
     // ground fog
     std::vector<SDL_Vertex> v = {
@@ -942,8 +979,8 @@ static void drawTiles() {
             int t = tiles[ty * LW + tx];
             float x = tx * TS + ox, y = ty * TS + oy;
             if (t == 1) {
-                rect(x, y, TS, TS, C(13, 8, 30));
-                rect(x + 3, y + 3, TS - 6, TS - 6, C(20, 12, 44));
+                SDL_FRect d{x, y, TS, TS};
+                SDL_RenderCopyF(R, texTile, nullptr, &d);
                 uint32_t hsh = (uint32_t)(tx * 73856093u ^ ty * 19349663u);
                 if (hsh % 7 == 0) {
                     SDL_Color c = zoneCol(tx);
@@ -1321,7 +1358,7 @@ static void drawOverlayScreen() {
 }
 
 static void render() {
-    drawSky();
+    SDL_RenderCopy(R, texSky, nullptr, nullptr);
     drawLayers();
     drawRain(false);
     drawTiles();
@@ -1359,6 +1396,8 @@ int main(int argc, char** argv) {
     R = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
     if (!R) R = SDL_CreateRenderer(win, -1, SDL_RENDERER_TARGETTEXTURE);
     if (!R) { fprintf(stderr, "renderer: %s\n", SDL_GetError()); return 1; }
+    bool perf = getenv("RASSOL_PERF") != nullptr;
+    if (perf) { SDL_RendererInfo ri; SDL_GetRendererInfo(R, &ri); fprintf(stderr, "renderer: %s  video: %s\n", ri.name, SDL_GetCurrentVideoDriver()); }
 
     texGlow = makeTex(128, 128, [](int x, int y) {
         float dx = (x - 63.5f) / 64.f, dy = (y - 63.5f) / 64.f, d = sqrtf(dx * dx + dy * dy);
@@ -1377,6 +1416,15 @@ int main(int argc, char** argv) {
         return C(0, 0, 5, (int)(clampf(v + sl, 0, 1) * 255));
     }, SDL_BLENDMODE_BLEND);
     for (int i = 0; i < 3; i++) texLayer[i] = makeLayer(i);
+    texSky = makeSky();
+    texTile = makeTex((int)TS, (int)TS, [](int x, int y) {
+        bool border = x < 3 || y < 3 || x >= TS - 3 || y >= TS - 3;
+        return border ? C(13, 8, 30) : C(20, 12, 44);
+    }, SDL_BLENDMODE_NONE);
+    // Everything is drawn into a fixed 1280x720 buffer and upscaled once, so
+    // fullscreen 1080p/1440p costs no extra overdraw on an integrated GPU.
+    texScreen = SDL_CreateTexture(R, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, SW, SH);
+    SDL_SetTextureBlendMode(texScreen, SDL_BLENDMODE_NONE);
     SDL_RenderSetLogicalSize(R, SW, SH);
 
     for (int i = 0; i < 220; i++)
@@ -1387,6 +1435,11 @@ int main(int argc, char** argv) {
     genLevel(1);
     P.x = 4 * TS; P.y = 10 * TS;
 
+    float vsyncDt = 1.f / 60.f;
+    SDL_DisplayMode dm;
+    if (SDL_GetCurrentDisplayMode(std::max(0, SDL_GetWindowDisplayIndex(win)), &dm) == 0 && dm.refresh_rate > 0) vsyncDt = 1.f / dm.refresh_rate;
+    float dtHist[4] = {vsyncDt, vsyncDt, vsyncDt, vsyncDt};
+    unsigned dtIdx = 0;
     Uint64 freq = SDL_GetPerformanceFrequency(), last = SDL_GetPerformanceCounter();
     bool running = true;
     int frame = 0;
@@ -1435,10 +1488,18 @@ int main(int argc, char** argv) {
         }
 
         Uint64 now = SDL_GetPerformanceCounter();
-        float dt = (float)((double)(now - last) / (double)freq);
+        float rawDt = (float)((double)(now - last) / (double)freq);
         last = now;
-        if (smokeFrames) dt = 1.f / 60.f;
-        dt = std::min(dt, 0.05f);
+        // Frame pacing: measured frame times jitter by about 1ms around the vsync
+        // period, which shows up as micro-stutter. Snap to whole vsync periods and
+        // average the last 4 frames so motion advances by an even step each frame;
+        // a missed vblank is then caught up over several frames, not in one jump.
+        float snapped = std::min(rawDt, 0.1f);
+        for (int k = 1; k <= 6; k++)
+            if (fabsf(snapped - k * vsyncDt) < 0.0015f) { snapped = k * vsyncDt; break; }
+        dtHist[dtIdx++ & 3] = snapped;
+        float dt = std::min((dtHist[0] + dtHist[1] + dtHist[2] + dtHist[3]) * 0.25f, 0.05f);
+        if (smokeFrames && !perf) dt = 1.f / 60.f;
         gameT += dt; stateT += dt; hintT -= dt; comboT -= dt;
         if (comboT <= 0) combo = 0;
 
@@ -1489,9 +1550,11 @@ int main(int argc, char** argv) {
         // camera
         if (state == TITLE) camX += 90 * dt;
         else if (state == PLAY) {
-            float target = P.x + P.w / 2 - SW / 2 + P.facing * 110 + P.vx * 0.18f;
-            target = clampf(target, 0, LW * TS - SW);
-            camX += (target - camX) * (1 - expf(-6.f * dt));
+            // Look-ahead eases on its own slow spring: flipping the aim across the
+            // jar used to yank the camera 220px within a few frames.
+            camLook += (P.facing * 110 + P.vx * 0.18f - camLook) * (1 - expf(-2.5f * dt));
+            float target = clampf(P.x + P.w / 2 - SW / 2 + camLook, 0, LW * TS - SW);
+            camX += (target - camX) * (1 - expf(-7.f * dt));
         }
         trauma = std::max(0.f, trauma - dt * 1.6f);
         float sh = trauma * trauma * 16;
@@ -1515,7 +1578,14 @@ int main(int argc, char** argv) {
         musicI += (clampf(target, 0, 1) - musicI) * std::min(1.f, dt * 1.5f);
         snd::intensity = musicI;
 
+        Uint64 tR0 = SDL_GetPerformanceCounter();
+        SDL_SetRenderTarget(R, texScreen);
         render();
+        SDL_SetRenderTarget(R, nullptr);
+        SDL_SetRenderDrawColor(R, 0, 0, 0, 255);
+        SDL_RenderClear(R);
+        SDL_RenderCopy(R, texScreen, nullptr, nullptr);
+        Uint64 tR1 = SDL_GetPerformanceCounter();
         frame++;
         if (smokeFrames && frame == smokeFrames - 1 && shotPath) {
             int w, h; SDL_GetRendererOutputSize(R, &w, &h);
@@ -1525,6 +1595,17 @@ int main(int argc, char** argv) {
             SDL_FreeSurface(s);
         }
         SDL_RenderPresent(R);
+        if (perf) {
+            Uint64 tP = SDL_GetPerformanceCounter();
+            auto ms = [&](Uint64 a, Uint64 b) { return (double)(b - a) * 1000.0 / freq; };
+            static double sDt = 0, mDt = 0, sUp = 0, sRe = 0, mRe = 0, sPr = 0, mPr = 0; static int cnt = 0;
+            double up = ms(now, tR0), re = ms(tR0, tR1), pr = ms(tR1, tP);
+            sDt += dt * 1000; mDt = std::max(mDt, (double)rawDt * 1000); sUp += up; sRe += re; mRe = std::max(mRe, re); sPr += pr; mPr = std::max(mPr, pr);
+            if (++cnt == 120) {
+                fprintf(stderr, "dt %.2f rawmax %.2f  upd %.2f  rend %.2f/%.2f  present %.2f/%.2f  parts %zu\n", sDt / cnt, mDt, sUp / cnt, sRe / cnt, mRe, sPr / cnt, mPr, parts.size());
+                sDt = mDt = sUp = sRe = mRe = sPr = mPr = 0; cnt = 0;
+            }
+        }
         if (smokeFrames && frame >= smokeFrames) running = false;
     }
     if (snd::dev) SDL_CloseAudioDevice(snd::dev);
