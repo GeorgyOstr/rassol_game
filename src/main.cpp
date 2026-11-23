@@ -504,7 +504,10 @@ enum EType { RAT, PIGEON, RACCOON, CAT };
 struct Enemy {
     int id; EType t; float x, y, w, h, vx = 0, vy = 0; int hp; float flash = 0, anim = 0, timer = 0, homeX = 0, baseY = 0, dash = 0;
     int dir = -1; bool onGround = false, hitWall = false, dead = false;
+    bool boss = false, wasAir = false; int mode = 0; float sc = 1, atkT = 2, modeT = 0, maxHp = 1;
 };
+// Boss projectiles: 0 egg, 1 ground shockwave, 2 trash can
+struct EProj { float x, y, vx, vy, grav, r; int kind; float life; bool dead = false; };
 struct Proj { float x, y, vx, vy, rot, vr; int type; float life; int pierce, bounces; int hit[4]; int nhit; bool dead = false; };
 struct Particle { float x, y, vx, vy, life, maxLife, size, grav, drag; SDL_Color c; int kind; };
 struct Popup { float x, y, life; std::string s; SDL_Color c; };
@@ -519,7 +522,7 @@ struct Player {
     float cooldown = 0, blink = 3, run = 0, dripT = 0;
 };
 
-enum State { TITLE, PLAY, DEAD, WIN };
+enum State { TITLE, PLAY, DEAD, WIN, VICTORY };
 static State state = TITLE;
 static Player P;
 static std::vector<Enemy> enemies;
@@ -531,6 +534,13 @@ static int level = 1, score = 0, nextId = 1, combo = 0;
 static float comboT = 0, hitstop = 0, trauma = 0, stateT = 0, gameT = 0, goalX = 0, hintT = 8;
 static float aimX = 1, aimY = 0, mouseX = SW / 2, mouseY = SH / 2;
 static bool mouseFire = false, keyFire = false, useMouseAim = true;
+static constexpr int MAX_LEVEL = 10;
+static std::vector<EProj> eprojs;
+static std::vector<Enemy> spawnQ;  // minions spawned mid-update, appended after the enemy loop
+static int arenaTx = 0, levelStartScore = 0;
+static bool arenaLocked = false, bossDead = false;
+static float bossIntroT = 0;
+static const char* bossName = "";
 
 static void spawnP(float x, float y, float vx, float vy, float life, float size, SDL_Color c, int kind = 1, float grav = 600, float drag = 1.5f) {
     if (parts.size() > 2500) return;
@@ -576,13 +586,16 @@ static void genLevel(int lvl) {
             h = std::clamp(h + irand(-2, 2), 2, 7);
         }
     }
-    for (int tx = LW - 16; tx < LW; tx++)
+    // Boss arena: flat floor, two dodge platforms, exit portal at the far wall.
+    arenaTx = LW - 30;
+    for (int tx = arenaTx - 4; tx < LW; tx++)
         for (int ty = 0; ty < LH; ty++) setT(tx, ty, ty >= LH - 3 ? 1 : 0);
-    goalX = (LW - 7) * TS;
+    for (int i = 0; i < 5; i++) { setT(arenaTx + 6 + i, LH - 6, 2); setT(arenaTx + 19 + i, LH - 6, 2); }
+    goalX = (LW - 3) * TS;
 
-    enemies.clear(); projs.clear(); parts.clear(); popups.clear();
+    enemies.clear(); projs.clear(); parts.clear(); popups.clear(); eprojs.clear(); spawnQ.clear();
     float density = std::min(0.22f + lvl * 0.05f, 0.5f);
-    for (int tx = 24; tx < LW - 18; tx++) {
+    for (int tx = 24; tx < arenaTx - 6; tx++) {
         if (frand(0, 1) > density / 1.0f * 0.5f) continue;
         int gt = groundTop(tx);
         if (gt < 0 || groundTop(tx - 1) != gt || groundTop(tx + 1) != gt) continue;
@@ -602,6 +615,24 @@ static void genLevel(int lvl) {
         enemies.push_back(e);
         tx += irand(4, 8);
     }
+    {
+        Enemy b{};
+        b.id = nextId++; b.boss = true;
+        bool fin = lvl >= MAX_LEVEL;
+        static const EType order[4] = {RAT, PIGEON, CAT, RACCOON};
+        static const char* names[4] = {"RAT KING", "PIGEON LORD", "TRASH BANDIT", "NEON TOMCAT"};  // by EType
+        b.t = fin ? RACCOON : order[(lvl - 1) % 4];
+        bossName = fin ? "TRASH KING" : names[b.t];
+        b.sc = fin ? 3.2f : 2.8f;
+        float bw = b.t == RAT ? 34.f : b.t == PIGEON ? 30.f : b.t == CAT ? 36.f : 40.f;
+        float bh = b.t == RAT ? 20.f : b.t == PIGEON ? 24.f : b.t == CAT ? 26.f : 34.f;
+        b.w = bw * b.sc; b.h = bh * b.sc;
+        b.hp = 30 + lvl * 10 + (fin ? 40 : 0); b.maxHp = (float)b.hp;
+        b.x = (arenaTx + 20) * TS; b.y = (LH - 3) * TS - b.h - (b.t == PIGEON ? 220.f : 0.f);
+        b.homeX = b.x; b.baseY = b.y; b.atkT = 1.5f;
+        enemies.push_back(b);
+    }
+    arenaLocked = false; bossDead = false; bossIntroT = 0;
 }
 
 static void respawnNear(float wx) {
@@ -618,6 +649,7 @@ static void respawnNear(float wx) {
 
 static void startLevel(bool fresh) {
     if (fresh) { level = 1; score = 0; }
+    levelStartScore = score;
     genLevel(level);
     P = Player{};
     P.hp = 5;
@@ -655,6 +687,22 @@ static void hurtPlayer(float fromX) {
 }
 
 static void killEnemy(Enemy& e) {
+    if (e.boss) {
+        e.dead = true; bossDead = true;
+        int pts = 2000 * level;
+        score += pts;
+        float cx = e.x + e.w / 2, cy = e.y + e.h / 2;
+        burst(cx, cy, 80, C(255, 215, 60), 800, 0, 0.9f, 4, 300);
+        burst(cx, cy, 60, C(255, 60, 200), 500, 1, 1.2f, 6, 700);
+        for (int i = 0; i < 10; i++) spawnP(cx + frand(-60, 60), cy + frand(-40, 40), 0, 0, 0.6f, 50 + i * 8, C(255, 120, 60), 4, 0, 0);
+        popup(cx, e.y - 20, "BOSS DOWN +" + std::to_string(pts), C(255, 215, 60));
+        for (auto& o : enemies)
+            if (!o.dead && !o.boss && o.x > arenaTx * TS) { o.dead = true; burst(o.x + o.w / 2, o.y + o.h / 2, 16, C(255, 215, 60), 400, 0, 0.5f, 3, 300); }
+        eprojs.clear();
+        trauma = 1.f; hitstop = 0.12f;
+        sfxBoom(); sfxWin();
+        return;
+    }
     e.dead = true;
     combo++; comboT = 2.5f;
     int pts = (e.t == RACCOON ? 300 : e.t == CAT ? 200 : 100) * std::min(combo, 8);
@@ -671,7 +719,7 @@ static void killEnemy(Enemy& e) {
 static void damageEnemy(Enemy& e, int dmg, float kx) {
     if (e.dead) return;
     e.hp -= dmg; e.flash = 0.1f;
-    if (e.t != PIGEON) { e.vx += kx * 160; if (e.onGround) e.vy = -180; }
+    if (e.t != PIGEON && !e.boss) { e.vx += kx * 160; if (e.onGround) e.vy = -180; }
     sfxHit();
     if (e.hp <= 0) killEnemy(e);
 }
@@ -860,6 +908,164 @@ static void updateProj(Proj& p, float dt) {
     }
 }
 
+static void eshoot(float x, float y, float vx, float vy, float grav, float r, int kind, float life = 4.f) {
+    eprojs.push_back(EProj{x, y, vx, vy, grav, r, kind, life});
+}
+static void shockwaves(float x, float spd) {
+    float gy = (LH - 3) * TS - 14;
+    eshoot(x, gy, -spd, 0, 0, 14, 1, 2.5f);
+    eshoot(x, gy, spd, 0, 0, 14, 1, 2.5f);
+    addTrauma(0.45f);
+    sfxBoom();
+}
+
+// Each boss: telegraphed attacks on timers; below half HP it enrages
+// (faster, shorter cooldowns, extra shockwaves/projectiles).
+static void updateBoss(Enemy& e, float dt) {
+    e.anim += dt; e.flash -= dt; e.timer += dt;
+    if (bossIntroT > 0.8f) return;  // wait for the WARNING banner
+    float pcx = P.x + P.w / 2, ecx = e.x + e.w / 2, dxp = pcx - ecx;
+    bool rage = e.hp * 2 < e.maxHp;
+    float sp = (1.f + 0.05f * (level - 1)) * (rage ? 1.25f : 1.f);
+    float cd = rage ? 0.6f : 1.f;
+    int face = dxp > 0 ? 1 : -1;
+    e.modeT -= dt;
+    auto telegraph = [&]() { if (fmodf(e.modeT, 0.16f) < 0.08f) e.flash = 0.03f; };
+    switch (e.t) {
+        case RAT: {
+            if (e.mode == 0) {
+                e.dir = face;
+                e.vx = lerpf(e.vx, face * 90.f * sp, std::min(1.f, 4 * dt));
+                e.atkT -= dt;
+                if (e.atkT <= 0) {
+                    int minions = 0;
+                    for (auto& o : enemies) minions += !o.dead && !o.boss && o.x > arenaTx * TS;
+                    if (minions < 4 && frand(0, 1) < 0.4f) {
+                        for (int i = 0; i < 2; i++) {
+                            Enemy m{}; m.id = nextId++; m.t = RAT; m.w = 34; m.h = 20; m.hp = 2; m.dir = i ? 1 : -1;
+                            m.x = ecx - 17 + m.dir * 30; m.y = e.y + e.h - 30; m.vy = -420; m.vx = m.dir * 150.f;
+                            spawnQ.push_back(m);
+                        }
+                        snd::play(900, 300, 0.25f, 2, 0.3f, 0.2f);
+                        e.atkT = 2.f * cd;
+                    } else { e.mode = 1; e.modeT = 0.55f; snd::play(200, 600, 0.5f, 2, 0.2f, 0.18f); }
+                }
+            } else if (e.mode == 1) { e.vx = 0; e.dir = face; telegraph(); if (e.modeT <= 0) { e.mode = 2; e.modeT = 1.6f; } }
+            else if (e.mode == 2) {
+                e.vx = e.dir * 640.f * sp;
+                if (e.hitWall || e.modeT <= 0) {
+                    e.mode = 3; e.modeT = 0.7f; addTrauma(0.5f); sfxBoom();
+                    if (rage) shockwaves(ecx, 380);
+                }
+            } else { e.vx = 0; if (e.modeT <= 0) { e.mode = 0; e.atkT = 1.6f * cd; } }
+            break;
+        }
+        case CAT: {
+            if (e.mode == 0) {
+                e.dir = face;
+                e.vx = lerpf(e.vx, face * 120.f * sp, std::min(1.f, 4 * dt));
+                e.atkT -= dt;
+                if (e.atkT <= 0 && e.onGround) {
+                    if (frand(0, 1) < 0.5f) { e.mode = 1; e.modeT = 0.35f; }
+                    else {
+                        e.mode = 4; e.vy = -950; e.vx = clampf(dxp / 0.85f, -650, 650); e.wasAir = false;
+                        snd::play(400, 1200, 0.2f, 2, 0.2f, 0.15f);
+                    }
+                }
+            } else if (e.mode == 1) {
+                e.vx = 0; e.dir = face; telegraph();
+                if (e.modeT <= 0) { e.mode = 2; e.modeT = 0.9f; snd::play(500, 1100, 0.15f, 2, 0.2f, 0.15f); }
+            } else if (e.mode == 2) {
+                e.vx = e.dir * 700.f * sp;
+                if (e.hitWall || e.modeT <= 0) { e.mode = 0; e.atkT = 1.3f * cd; }
+            } else if (e.mode == 4) {
+                if (!e.onGround) e.wasAir = true;
+                else if (e.wasAir) {
+                    e.mode = 0; e.atkT = 1.2f * cd; e.vx = 0; addTrauma(0.3f);
+                    if (rage) shockwaves(ecx, 420); else sfxLand();
+                }
+            }
+            break;
+        }
+        case RACCOON: {
+            if (e.mode == 0) {
+                e.dir = face;
+                e.vx = lerpf(e.vx, 0, std::min(1.f, 6 * dt));
+                if (e.timer > (rage ? 1.1f : 2.2f)) {
+                    e.timer = 0;
+                    eshoot(ecx, e.y + 10, clampf(dxp, -520, 520), -650, 1300, 13, 2);
+                    if (level >= MAX_LEVEL) eshoot(ecx, e.y + 10, clampf(dxp * 0.6f, -520, 520), -800, 1300, 13, 2);
+                    snd::play(300, 150, 0.15f, 2, 0.4f, 0.15f);
+                }
+                e.atkT -= dt;
+                if (e.atkT <= 0 && e.onGround) { e.mode = 1; e.modeT = 0.4f; }
+            } else if (e.mode == 1) {
+                telegraph(); e.vx = 0;
+                if (e.modeT <= 0) { e.mode = 4; e.vy = -1050; e.vx = clampf(dxp, -480, 480) * sp; e.wasAir = false; }
+            } else if (e.mode == 4) {
+                if (!e.onGround) e.wasAir = true;
+                else if (e.wasAir) { e.mode = 0; e.atkT = 1.6f * cd; e.vx = 0; shockwaves(ecx, 430 * sp); }
+            }
+            break;
+        }
+        case PIGEON: {
+            float minX = (arenaTx + 1) * TS, maxX = LW * TS - TS - e.w, groundY = (LH - 3) * TS;
+            if (e.mode == 0) {
+                float tx = clampf(pcx - e.w / 2 + sinf(e.timer * 0.8f) * 200, minX, maxX);
+                e.vx = lerpf(e.vx, clampf((tx - e.x) * 2, -260 * sp, 260 * sp), std::min(1.f, 3 * dt));
+                if (fabsf(e.vx) > 5) e.dir = e.vx > 0 ? 1 : -1;
+                e.vy = (e.baseY + sinf(e.timer * 2.f) * 30 - e.y) * 3;
+                e.dash -= dt;
+                if (e.dash <= 0) {
+                    e.dash = 0.9f * cd;
+                    eshoot(ecx, e.y + e.h * 0.8f, e.vx * 0.3f, 50, 900, 9, 0);
+                    if (rage) { eshoot(ecx, e.y + e.h * 0.8f, -180, -100, 900, 9, 0); eshoot(ecx, e.y + e.h * 0.8f, 180, -100, 900, 9, 0); }
+                    snd::play(700, 400, 0.08f, 0, 0.1f, 0.1f);
+                }
+                e.atkT -= dt;
+                if (e.atkT <= 0) { e.mode = 1; e.modeT = 0.5f; snd::play(300, 900, 0.45f, 2, 0.3f, 0.15f); }
+            } else if (e.mode == 1) {
+                e.vx *= 0.9f; e.vy = -60; telegraph();
+                if (e.modeT <= 0) { e.mode = 2; e.modeT = 1.4f; e.homeX = pcx; }
+            } else if (e.mode == 2) {
+                float dx = e.homeX - e.w / 2 - e.x, dy = groundY - e.h - 6 - e.y, l = sqrtf(dx * dx + dy * dy) + 1;
+                e.vx = dx / l * 620 * sp; e.vy = dy / l * 620 * sp;
+                e.dir = dx > 0 ? 1 : -1;
+                if (l < 20 || e.modeT <= 0) { e.mode = 3; e.modeT = 0.f; addTrauma(0.3f); }
+            } else {
+                e.vx *= 0.95f; e.vy = (e.baseY - e.y) * 2.5f;
+                if (fabsf(e.y - e.baseY) < 15 || e.modeT < -1.5f) { e.mode = 0; e.atkT = 4.f * cd; }
+            }
+            e.x = clampf(e.x + e.vx * dt, minX, maxX);
+            e.y += e.vy * dt;
+            return;
+        }
+    }
+    e.vy = std::min(e.vy + 2200 * dt, 1400.f);
+    moveBody(e.x, e.y, e.w, e.h, e.vx, e.vy, e.onGround, e.hitWall, true, dt);
+}
+
+static void updateEProjs(float dt) {
+    for (auto& q : eprojs) {
+        if (q.dead) continue;
+        q.vy += q.grav * dt;
+        q.x += q.vx * dt; q.y += q.vy * dt;
+        q.life -= dt;
+        float fx = q.kind == 1 ? q.x + (q.vx > 0 ? q.r : -q.r) : q.x;
+        if (q.life <= 0 || solid((int)floorf(fx / TS), (int)floorf(q.y / TS))) {
+            q.dead = true;
+            SDL_Color c = q.kind == 0 ? C(255, 240, 180) : q.kind == 1 ? C(255, 40, 200) : C(0, 240, 255);
+            burst(q.x, q.y, 12, c, 260, 1, 0.4f, 2.5f, 700);
+            continue;
+        }
+        if (q.x + q.r > P.x + 3 && q.x - q.r < P.x + P.w - 3 && q.y + q.r > P.y + 3 && q.y - q.r < P.y + P.h) {
+            hurtPlayer(q.x);
+            if (q.kind != 1) q.dead = true;
+        }
+    }
+    eprojs.erase(std::remove_if(eprojs.begin(), eprojs.end(), [](const EProj& q) { return q.dead; }), eprojs.end());
+}
+
 static void updateParticles(float dt) {
     for (auto& q : parts) {
         float py = q.y;
@@ -877,19 +1083,30 @@ static void stepGame(float dt, const Uint8* ks) {
     if (state == PLAY) {
         updatePlayer(dt, ks);
         if ((mouseFire || keyFire) && P.cooldown <= 0) throwVeg();
+        if (!arenaLocked && P.x > (arenaTx + 2) * TS) {
+            // Seal the arena behind the player: no way out until the boss is dead.
+            arenaLocked = true; bossIntroT = 2.6f;
+            for (int ty = 0; ty < LH - 3; ty++) tiles[ty * LW + arenaTx] = 1;
+            for (int ty = 0; ty < LH - 3; ty++) burst(arenaTx * TS + TS / 2, ty * TS + TS / 2, 3, C(255, 40, 60), 200, 0, 0.4f, 3, 0);
+            addTrauma(0.6f); sfxBoom();
+        }
         for (auto& e : enemies) {
-            if (e.dead || fabsf(e.x - P.x) > 1300) continue;
-            updateEnemy(e, dt);
+            if (e.dead) continue;
+            if (e.boss) { if (!arenaLocked) continue; updateBoss(e, dt); }
+            else { if (fabsf(e.x - P.x) > 1300) continue; updateEnemy(e, dt); }
             if (!e.dead && P.x < e.x + e.w - 4 && P.x + P.w > e.x + 4 && P.y < e.y + e.h - 4 && P.y + P.h > e.y + 4)
                 hurtPlayer(e.x + e.w / 2);
         }
+        for (auto& m : spawnQ) enemies.push_back(m);
+        spawnQ.clear();
         for (auto& p : projs) if (!p.dead) updateProj(p, dt);
+        updateEProjs(dt);
         if (P.y > LH * TS + 80 && state == PLAY) {
             hurtPlayer(P.x);
             if (state == PLAY) { respawnNear(P.x); P.invuln = 1.5f; }
         }
-        if (P.x + P.w / 2 > goalX && state == PLAY) {
-            state = WIN; stateT = 0; score += 1000 * level + P.hp * 250; sfxWin();
+        if (P.x + P.w / 2 > goalX && state == PLAY && bossDead) {
+            state = level >= MAX_LEVEL ? VICTORY : WIN; stateT = 0; score += 1000 * level + P.hp * 250; sfxWin();
             burst(goalX, P.y, 80, C(0, 240, 255), 700, 0, 0.9f, 3, 100);
         }
     }
@@ -1032,17 +1249,21 @@ static void drawTiles() {
 
 static void drawPortal() {
     float x = goalX - camX + shakeX, y = (LH - 3) * TS - camY + shakeY;
+    if (x < -250 || x > SW + 250) return;
     float t = gameT;
+    SDL_Color a = bossDead ? C(0, 240, 255) : C(255, 40, 60), b = bossDead ? C(255, 40, 200) : C(140, 20, 50);
+    float spin = bossDead ? 1.f : 0.15f;
     blend(SDL_BLENDMODE_ADD);
-    glowLine(x, y, x, 0, 40, C(0, 240, 255), 0.25f + 0.1f * sinf(t * 4));
-    glow(x, y - 70, 140, C(0, 200, 255), 0.5f);
+    glowLine(x, y, x, 0, 40, a, (bossDead ? 0.25f : 0.08f) + 0.1f * sinf(t * 4));
+    glow(x, y - 70, 140, a, bossDead ? 0.5f : 0.25f);
     for (int i = 0; i < 3; i++) {
         float r = 50 + i * 14 + sinf(t * 3 + i) * 4;
-        auto pts = ell(Xf{x, y - 70}, 0, 0, r * 0.55f, r, t * (i % 2 ? -1.5f : 1.f) * 0.3f, 32);
-        stroke(pts, 3, i == 1 ? C(255, 40, 200) : C(0, 240, 255));
+        auto pts = ell(Xf{x, y - 70}, 0, 0, r * 0.55f, r, t * spin * (i % 2 ? -1.5f : 1.f) * 0.3f, 32);
+        stroke(pts, 3, i == 1 ? b : a);
     }
+    if (!bossDead) { line(x - 35, y - 130, x + 35, y - 10, 4, a); line(x + 35, y - 130, x - 35, y - 10, 4, a); }
     blend(SDL_BLENDMODE_BLEND);
-    text("EXIT", x, y - 175, 3, C(200, 255, 255), true, 0.4f);
+    text(bossDead ? "EXIT" : "LOCKED", x, y - 175, 3, bossDead ? C(200, 255, 255) : C(255, 120, 120), true, 0.4f);
 }
 
 static void drawVeg(int type, float x, float y, float rot, float sc) {
@@ -1172,8 +1393,9 @@ static void drawPlayer() {
 
 static void drawEnemy(const Enemy& e) {
     float cx = e.x + e.w / 2 - camX + shakeX, by = e.y + e.h - camY + shakeY;
-    if (cx < -80 || cx > SW + 80) return;
-    Xf xf{cx, by, (float)e.dir, 1, 0};
+    if (cx < -80 - e.w || cx > SW + 80 + e.w) return;
+    float sc = e.sc, lw = e.boss ? 3.5f : 2.f;
+    Xf xf{cx, by, (float)e.dir * sc, sc, 0};
     bool fl = e.flash > 0;
     SDL_Color neon = e.t == RAT ? C(255, 60, 200) : e.t == PIGEON ? C(60, 220, 255) : e.t == CAT ? C(255, 230, 60) : C(255, 140, 40);
     SDL_Color body = fl ? C(255, 255, 255) : C(28, 10, 40);
@@ -1185,30 +1407,30 @@ static void drawEnemy(const Enemy& e) {
     blend(SDL_BLENDMODE_BLEND);
     auto leg = [&](float lx, float ly, float ph) {
         auto p0 = xf(lx, ly), p1 = xf(lx + sinf(a * 14 + ph) * 4, 0);
-        line(p0.x, p0.y, p1.x, p1.y, 2.5f, line2);
+        line(p0.x, p0.y, p1.x, p1.y, lw * 1.25f, line2);
     };
     auto eyeAt = [&](float lx, float ly, float r, SDL_Color c) {
         auto q = xf(lx, ly);
-        blend(SDL_BLENDMODE_ADD); glow(q.x, q.y, r * 5, c, 0.7f); blend(SDL_BLENDMODE_BLEND);
-        circle(q.x, q.y, r, c);
+        blend(SDL_BLENDMODE_ADD); glow(q.x, q.y, r * 5 * sc, c, 0.7f); blend(SDL_BLENDMODE_BLEND);
+        circle(q.x, q.y, r * sc, c);
     };
     switch (e.t) {
         case RAT: {
             std::vector<SDL_FPoint> tail;
             for (int i = 0; i <= 8; i++) tail.push_back(xf(-14.f - i * 2.6f, -7 + sinf(a * 8 + i * 0.7f) * 3 - i * 0.6f));
-            stroke(tail, 2, line2, false);
+            stroke(tail, lw, line2, false);
             leg(-7, -4, 0); leg(7, -4, PI);
-            auto bd = ell(xf, 0, -9, 15, 8); fillPoly(bd, body); stroke(bd, 2, line2);
-            auto hd = ell(xf, 13, -10, 7.5f, 6, 0.2f); fillPoly(hd, body); stroke(hd, 2, line2);
-            auto ear = ell(xf, 9, -17, 4, 4.5f); fillPoly(ear, body); stroke(ear, 2, line2);
+            auto bd = ell(xf, 0, -9, 15, 8); fillPoly(bd, body); stroke(bd, lw, line2);
+            auto hd = ell(xf, 13, -10, 7.5f, 6, 0.2f); fillPoly(hd, body); stroke(hd, lw, line2);
+            auto ear = ell(xf, 9, -17, 4, 4.5f); fillPoly(ear, body); stroke(ear, lw, line2);
             eyeAt(16, -12, 1.8f, eye);
             break;
         }
         case PIGEON: {
             float flap = sinf(a * 16);
             tri(xf, -2, -14, -16, -14 - 12 * flap, 6, -13, fl ? body : C(40, 80, 120));
-            auto bd = ell(xf, 0, -11, 13, 8.5f); fillPoly(bd, body); stroke(bd, 2, line2);
-            auto hd = ell(xf, 11, -18, 6, 6); fillPoly(hd, body); stroke(hd, 2, line2);
+            auto bd = ell(xf, 0, -11, 13, 8.5f); fillPoly(bd, body); stroke(bd, lw, line2);
+            auto hd = ell(xf, 11, -18, 6, 6); fillPoly(hd, body); stroke(hd, lw, line2);
             tri(xf, 16, -19, 23, -17, 16, -15, C(255, 210, 60));
             tri(xf, -12, -10, -20, -6, -18, -13, line2);
             eyeAt(13, -19, 1.6f, eye);
@@ -1217,13 +1439,13 @@ static void drawEnemy(const Enemy& e) {
         case CAT: {
             std::vector<SDL_FPoint> tail;
             for (int i = 0; i <= 8; i++) tail.push_back(xf(-15.f - i * 1.6f, -11 - i * 2.4f + sinf(a * 4 + i * 0.5f) * 2));
-            stroke(tail, 3, line2, false);
+            stroke(tail, lw * 1.5f, line2, false);
             float sp = e.dash > 0 ? 2.f : 1.f;
             leg(-9, -4, 0); leg(-4, -4, PI * sp); leg(5, -4, PI * 0.5f); leg(10, -4, PI * 1.5f);
-            auto bd = ell(xf, 0, -11, 16, 8); fillPoly(bd, body); stroke(bd, 2, line2);
+            auto bd = ell(xf, 0, -11, 16, 8); fillPoly(bd, body); stroke(bd, lw, line2);
             tri(xf, 9, -23, 11, -32, 15, -25, line2);
             tri(xf, 16, -25, 20, -32, 21, -22, line2);
-            auto hd = ell(xf, 15, -18, 8, 7); fillPoly(hd, body); stroke(hd, 2, line2);
+            auto hd = ell(xf, 15, -18, 8, 7); fillPoly(hd, body); stroke(hd, lw, line2);
             eyeAt(18, -19, 2.f, C(180, 255, 60));
             break;
         }
@@ -1233,14 +1455,52 @@ static void drawEnemy(const Enemy& e) {
                 fillPoly(tp, fl ? body : (i % 2 ? C(30, 20, 20) : C(120, 90, 80))); stroke(tp, 1.5f, line2);
             }
             leg(-10, -5, 0); leg(10, -5, PI);
-            auto bd = ell(xf, 0, -15, 19, 13); fillPoly(bd, body); stroke(bd, 2, line2);
+            auto bd = ell(xf, 0, -15, 19, 13); fillPoly(bd, body); stroke(bd, lw, line2);
             tri(xf, 10, -31, 12, -39, 17, -32, line2);
             tri(xf, 19, -32, 24, -38, 24, -29, line2);
-            auto hd = ell(xf, 17, -24, 10, 9); fillPoly(hd, body); stroke(hd, 2, line2);
+            auto hd = ell(xf, 17, -24, 10, 9); fillPoly(hd, body); stroke(hd, lw, line2);
             auto mask = ell(xf, 19, -25, 8.5f, 3.5f); fillPoly(mask, C(5, 0, 10));
             eyeAt(17, -25, 1.8f, eye); eyeAt(22, -25, 1.8f, eye);
-            circle(xf(27, -21).x, xf(27, -21).y, 2, C(20, 10, 20));
+            circle(xf(27, -21).x, xf(27, -21).y, 2 * sc, C(20, 10, 20));
             break;
+        }
+    }
+    if (e.boss) {
+        float hx = e.t == RAT ? 12.f : e.t == PIGEON ? 11.f : e.t == CAT ? 15.5f : 17.f;
+        float hy = e.t == RAT ? -16.f : e.t == PIGEON ? -24.f : e.t == CAT ? -26.f : -34.f;
+        SDL_Color g = C(255, 215, 60);
+        fillPoly({xf(hx - 6, hy), xf(hx + 6, hy), xf(hx + 6, hy - 3), xf(hx - 6, hy - 3)}, g);
+        tri(xf, hx - 6, hy - 3, hx - 2.5f, hy - 3, hx - 5.5f, hy - 8, g);
+        tri(xf, hx - 2, hy - 3, hx + 2, hy - 3, hx, hy - 10, g);
+        tri(xf, hx + 2.5f, hy - 3, hx + 6, hy - 3, hx + 5.5f, hy - 8, g);
+        auto cp = xf(hx, hy - 5);
+        blend(SDL_BLENDMODE_ADD);
+        glow(cp.x, cp.y, 40, g, 0.5f);
+        if (e.hp * 2 < e.maxHp) glow(cx, by - e.h / 2, e.w * 1.2f, C(255, 30, 50), 0.25f + 0.1f * sinf(gameT * 12));
+        blend(SDL_BLENDMODE_BLEND);
+    }
+}
+static void drawEProjs() {
+    float ox = -camX + shakeX, oy = -camY + shakeY;
+    for (auto& q : eprojs) {
+        float x = q.x + ox, y = q.y + oy;
+        if (q.kind == 0) {
+            blend(SDL_BLENDMODE_ADD); glow(x, y, 28, C(255, 230, 120), 0.5f); blend(SDL_BLENDMODE_BLEND);
+            auto b = ell(Xf{x, y}, 0, 0, 7, 9);
+            fillPoly(b, C(250, 245, 230)); stroke(b, 1.5f, C(255, 220, 100));
+        } else if (q.kind == 1) {
+            float d = q.vx > 0 ? 1.f : -1.f, pulse = 1 + 0.15f * sinf(gameT * 30);
+            blend(SDL_BLENDMODE_ADD);
+            glow(x, y, 44 * pulse, C(255, 40, 200), 0.7f);
+            fillPoly({{x + d * 12, y + 14}, {x - d * 10, y - 22 * pulse}, {x - d * 22, y + 14}}, C(255, 60, 220, 200));
+            line(x - d * 10, y - 22 * pulse, x + d * 12, y + 14, 2, C(255, 220, 255));
+            blend(SDL_BLENDMODE_BLEND);
+        } else {
+            blend(SDL_BLENDMODE_ADD); glow(x, y, 34, C(0, 240, 255), 0.4f); blend(SDL_BLENDMODE_BLEND);
+            Xf xf{x, y, 1, 1, q.life * 9};
+            auto b = roundRect(xf, -9, -12, 18, 24, 3);
+            fillPoly(b, C(60, 60, 80)); stroke(b, 2, C(0, 240, 255));
+            auto a = xf(-10, -8), c = xf(10, -8); line(a.x, a.y, c.x, c.y, 2, C(150, 255, 255));
         }
     }
 }
@@ -1292,7 +1552,7 @@ static void drawHeart(float x, float y, float s, bool full) {
 
 static void drawHUD() {
     for (int i = 0; i < 5; i++) drawHeart(34 + i * 34.f, 34, 1.2f, i < P.hp);
-    text("LVL " + std::to_string(level), 22, 58, 3, C(150, 120, 255), false, 0.25f);
+    text("LVL " + std::to_string(level) + "/" + std::to_string(MAX_LEVEL), 22, 58, 3, C(150, 120, 255), false, 0.25f);
     char buf[32]; snprintf(buf, sizeof buf, "%07d", score);
     text(buf, SW / 2, 18, 5, C(0, 240, 255), true, 0.35f);
     if (combo > 1 && comboT > 0) text("COMBO X" + std::to_string(std::min(combo, 8)), SW / 2, 62, 3, C(255, 220, 60), true, 0.4f);
@@ -1316,6 +1576,23 @@ static void drawHUD() {
     }
     text(VEG[P.veg].name, SW - 4 * 66.f - 14 + 2 * 66 - 4, 88, 2, VEG[P.veg].col, true, 0.3f);
 
+    for (auto& e : enemies) {
+        if (!e.boss || e.dead || !arenaLocked) continue;
+        float bw = 560, bx = SW / 2 - bw / 2;
+        bool rage = e.hp * 2 < e.maxHp;
+        text(bossName, SW / 2, 90, 2, rage ? C(255, 60, 60) : C(255, 120, 200), true, 0.35f);
+        rect(bx - 2, 106, bw + 4, 14, C(40, 10, 30, 230));
+        float k = clampf(e.hp / e.maxHp, 0, 1);
+        SDL_Color c = rage ? C(255, 40, 60) : C(255, 100, 200);
+        rect(bx, 108, bw * k, 10, c);
+        blend(SDL_BLENDMODE_ADD); glow(bx + bw * k, 113, 24, c, 0.8f); blend(SDL_BLENDMODE_BLEND);
+    }
+    if (bossIntroT > 0) {
+        Uint8 al = (Uint8)(255 * clampf(bossIntroT, 0, 1));
+        if (fmodf(gameT, 0.4f) < 0.26f) text("WARNING", SW / 2, 230, 9, C(255, 40, 60, al), true, 0.5f);
+        text(bossName, SW / 2, 320, 6, C(255, 215, 60, al), true, 0.5f);
+    }
+    if (arenaLocked) return;
     // progress bar
     float px0 = 200, px1 = SW - 200, py = SH - 22;
     rect(px0, py, px1 - px0, 3, C(60, 40, 90, 200));
@@ -1349,11 +1626,17 @@ static void drawOverlayScreen() {
         text("JAR BROKEN", SW / 2, 230, 12, C(255, 40, 80), true, 0.55f);
         text("SCORE " + std::to_string(score), SW / 2, 370, 5, C(0, 240, 255), true, 0.4f);
         if (stateT > 1 && fmodf(gameT, 1.f) < 0.65f) text("PRESS R TO RETRY", SW / 2, 450, 4, C(255, 220, 60), true, 0.4f);
+    } else if (state == VICTORY) {
+        rect(0, 0, SW, SH, C(0, 10, 20, (int)std::min(150.f, stateT * 200)));
+        text("BRINE CHAMPION", SW / 2, 190, 10, C(90, 255, 120), true, 0.6f);
+        text("ALL 10 LEVELS AND BOSSES CLEARED", SW / 2, 300, 3, C(0, 240, 255), true, 0.4f);
+        text("SCORE " + std::to_string(score), SW / 2, 360, 5, C(255, 215, 60), true, 0.4f);
+        if (stateT > 1.5f && fmodf(gameT, 1.f) < 0.65f) text("PRESS ENTER", SW / 2, 450, 4, C(255, 220, 60), true, 0.4f);
     } else if (state == WIN) {
         rect(0, 0, SW, SH, C(0, 10, 20, (int)std::min(150.f, stateT * 200)));
         text("LEVEL CLEAR", SW / 2, 220, 11, C(0, 240, 255), true, 0.55f);
         text("SCORE " + std::to_string(score), SW / 2, 360, 5, C(90, 255, 120), true, 0.4f);
-        if (stateT > 1 && fmodf(gameT, 1.f) < 0.65f) text("PRESS ENTER FOR NEXT LEVEL", SW / 2, 440, 4, C(255, 220, 60), true, 0.4f);
+        if (stateT > 1 && fmodf(gameT, 1.f) < 0.65f) text("LEVEL " + std::to_string(level + 1) + "/10 NEXT - PRESS ENTER", SW / 2, 440, 4, C(255, 220, 60), true, 0.4f);
     }
 }
 
@@ -1364,11 +1647,12 @@ static void render() {
     drawTiles();
     drawPortal();
     for (auto& e : enemies) if (!e.dead) drawEnemy(e);
+    drawEProjs();
     for (auto& p : projs) {
         if (p.dead) continue;
         drawVeg(p.type, p.x - camX + shakeX, p.y - camY + shakeY, p.rot, 1.f);
     }
-    if (state == PLAY || state == WIN) drawPlayer();
+    if (state == PLAY || state == WIN || state == VICTORY) drawPlayer();
     drawParticles();
     drawRain(true);
     for (auto& pp : popups) {
@@ -1384,9 +1668,11 @@ static void render() {
 // MAIN
 // ============================================================================
 int main(int argc, char** argv) {
-    int smokeFrames = 0; const char* shotPath = nullptr;
+    int smokeFrames = 0, cliLevel = 1; bool cliBoss = false; const char* shotPath = nullptr;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--smoke") && i + 1 < argc) smokeFrames = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--level") && i + 1 < argc) cliLevel = std::clamp(atoi(argv[++i]), 1, MAX_LEVEL);
+        else if (!strcmp(argv[i], "--boss")) cliBoss = true;
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shotPath = argv[++i];
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
@@ -1460,7 +1746,8 @@ int main(int argc, char** argv) {
                         bool fs = SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP;
                         SDL_SetWindowFullscreen(win, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
                     } else if (state == TITLE && (k == SDLK_RETURN || k == SDLK_SPACE)) startLevel(true);
-                    else if (state == DEAD && stateT > 0.6f && (k == SDLK_r || k == SDLK_RETURN)) startLevel(true);
+                    else if (state == DEAD && stateT > 0.6f && (k == SDLK_r || k == SDLK_RETURN)) { score = levelStartScore; startLevel(false); }
+                    else if (state == VICTORY && stateT > 1.5f && k == SDLK_RETURN) { state = TITLE; level = 1; genLevel(1); }
                     else if (state == WIN && stateT > 0.6f && k == SDLK_RETURN) { level++; startLevel(false); }
                     else if (state == PLAY) {
                         if (k == SDLK_SPACE || k == SDLK_w || k == SDLK_UP || k == SDLK_k) { P.jumpBuf = 0.13f; P.jumpHeld = true; }
@@ -1502,7 +1789,7 @@ int main(int argc, char** argv) {
         dtHist[dtIdx++ & 3] = snapped;
         float dt = std::min((dtHist[0] + dtHist[1] + dtHist[2] + dtHist[3]) * 0.25f, 0.05f);
         if (smokeFrames && !perf) dt = 1.f / 60.f;
-        gameT += dt; stateT += dt; hintT -= dt; comboT -= dt;
+        gameT += dt; stateT += dt; hintT -= dt; comboT -= dt; bossIntroT -= dt;
         if (comboT <= 0) combo = 0;
 
         const Uint8* ks = SDL_GetKeyboardState(nullptr);
@@ -1510,7 +1797,11 @@ int main(int argc, char** argv) {
         // smoke-test autopilot: run right, jump, throw
         static Uint8 fakeKeys[SDL_NUM_SCANCODES];
         if (smokeFrames) {
-            if (state == TITLE && frame > 5) startLevel(true);
+            if (state == TITLE && frame > 5) {
+                startLevel(true);
+                if (cliLevel > 1) { level = cliLevel; startLevel(false); }
+                if (cliBoss) { P.x = (arenaTx + 3) * TS; P.y = (LH - 3) * TS - P.h; camX = P.x - 300; P.hp = 999; }
+            }
             memset(fakeKeys, 0, sizeof fakeKeys);
             fakeKeys[SDL_SCANCODE_D] = 1;
             ks = fakeKeys;
@@ -1519,6 +1810,9 @@ int main(int argc, char** argv) {
             mouseFire = true; mouseX = SW * 0.8f; mouseY = SH * 0.6f;
             if (frame % 90 == 0) P.veg = (P.veg + 1) % VEG_N;
             if (state == DEAD && stateT > 1) startLevel(true);
+            if (state == WIN && stateT > 1) { level++; startLevel(false); if (cliBoss) { P.x = (arenaTx + 3) * TS; P.y = (LH - 3) * TS - P.h; P.hp = 999; } }
+            for (auto& e : enemies)
+                if (e.boss && !e.dead && arenaLocked) { mouseX = e.x + e.w / 2 - camX; mouseY = e.y + e.h / 2 - camY; fakeKeys[SDL_SCANCODE_D] = 0; }
         }
 
         // aim
@@ -1533,7 +1827,7 @@ int main(int argc, char** argv) {
         }
 
         if (hitstop > 0) hitstop -= dt;
-        else if (state == PLAY || state == DEAD || state == WIN) {
+        else if (state != TITLE) {
             int n = (int)ceilf(dt / (1.f / 240.f));
             float h = dt / n;
             for (int i = 0; i < n; i++) stepGame(h, ks);
@@ -1575,6 +1869,7 @@ int main(int argc, char** argv) {
             int near = 0;
             for (auto& e : enemies) if (!e.dead && fabsf(e.x - P.x) < 650) near++;
             target = 0.38f + near * 0.12f + (P.hp <= 2 ? 0.25f : 0.f);
+            if (arenaLocked && !bossDead) target = 1.f;
         } else if (state == DEAD) target = 0.1f;
         else if (state == WIN) target = 0.5f;
         musicI += (clampf(target, 0, 1) - musicI) * std::min(1.f, dt * 1.5f);
